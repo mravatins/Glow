@@ -1,0 +1,56 @@
+const float KERNEL[3] = float[3](1.0, 2.0 / 3.0, 1.0 / 6.0);
+
+// Edge-avoiding wavelet filter guided by normals, distance and the variance from the temporal pass.
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(filterA);
+	if (any(greaterThanEqual(p, size))) return;
+	bool fromB = (pc.iteration & 1) == 0;
+	vec4 center = fromB ? imageLoad(filterB, p) : imageLoad(filterA, p);
+	// Light shafts are half the render size. Their pixel p was traced at render pixel 2p, which is where its surface data is.
+	ivec2 fullSize = imageSize(gCurrent);
+	int scale = fullSize.x > size.x ? 2 : 1;
+	ivec2 fp = min(p * scale, fullSize - 1);
+	vec4 g = imageLoad(gCurrent, fp);
+	vec4 result = center;
+	if (g.w > 0.0 && (pc.flags & 32) == 0) {
+		int stepSize = 1 << pc.iteration;
+		float centerLum = luminance(center.rgb);
+		float blurred = 0.0;
+		for (int y = -1; y <= 1; y++) {
+			for (int x = -1; x <= 1; x++) {
+				ivec2 q = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+				blurred += (fromB ? imageLoad(filterB, q) : imageLoad(filterA, q)).a;
+			}
+		}
+		float phiLuminance = 4.0 * sqrt(max(blurred / 9.0, 0.0)) + 0.05;
+		// Neighbours are weighed by how far they sit from this pixel's own plane, not by how much further from the camera they are, so a floor
+		// seen at a shallow angle, where distance changes fast from pixel to pixel, still filters across its whole width.
+		float phiDistance = 0.05 + g.w * 0.01;
+		loadUpscale();
+		vec3 ray = normalize(unprojectUv(rasterUv(rasterPixel(fp)), 0.0001));
+		vec3 rayX = normalize(unprojectUv(rasterUv(rasterPixel(fp + ivec2(scale, 0))), 0.0001)) - ray;
+		vec3 rayY = normalize(unprojectUv(rasterUv(rasterPixel(fp + ivec2(0, scale))), 0.0001)) - ray;
+		vec3 pos = ray * g.w;
+		vec3 sum = vec3(0.0);
+		float variance = 0.0, total = 0.0;
+		for (int y = -2; y <= 2; y++) {
+			for (int x = -2; x <= 2; x++) {
+				ivec2 q = p + ivec2(x, y) * stepSize;
+				if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) continue;
+				vec4 other = fromB ? imageLoad(filterB, q) : imageLoad(filterA, q);
+				vec4 otherG = imageLoad(gCurrent, min(q * scale, fullSize - 1));
+				if (otherG.w <= 0.0) continue;
+				vec3 otherPos = normalize(ray + rayX * float(x * stepSize) + rayY * float(y * stepSize)) * otherG.w;
+				float weight = KERNEL[abs(x)] * KERNEL[abs(y)];
+				weight *= pow(max(dot(g.xyz, otherG.xyz), 0.0), 32.0);
+				weight *= exp(-abs(dot(g.xyz, otherPos - pos)) / phiDistance - abs(centerLum - luminance(other.rgb)) / phiLuminance);
+				sum += other.rgb * weight;
+				variance += other.a * weight * weight;
+				total += weight;
+			}
+		}
+		if (total > 0.0001) result = vec4(sum / total, variance / (total * total));
+	}
+	if (fromB) imageStore(filterA, p, result); else imageStore(filterB, p, result);
+}

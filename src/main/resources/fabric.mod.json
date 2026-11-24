@@ -1,0 +1,11 @@
+{
+	"schemaVersion": 1,
+	"id": "glow",
+	"version": "${version}",
+	"name": "Glow",
+	"description": "Native Vulkan ray tracing for Minecraft.",
+	"environment": "client",
+	"entrypoints": { "preLaunch": ["dev.glow.GlowNvidia"], "client": ["dev.glow.GlowClient"] },
+	"mixins": ["glow.mixins.json"],
+	"depends": { "fabricloader": ">=0.20.1", "java": ">=25" }
+}

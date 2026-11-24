@@ -1,0 +1,105 @@
+const float MAX_HISTORY = 32.0;
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(noisyImage);
+	if (any(greaterThanEqual(p, size))) return;
+	loadUpscale();
+	// Light shafts are half the render size. Their pixel p was traced at render pixel 2p, which is where its surface data is.
+	ivec2 fullSize = imageSize(gCurrent);
+	int scale = fullSize.x > size.x ? 2 : 1;
+	ivec2 fp = min(p * scale, fullSize - 1);
+	vec2 uv = rasterUv(rasterPixel(fp));
+	vec3 noisy = imageLoad(noisyImage, p).rgb;
+	vec4 g = imageLoad(gCurrent, fp);
+	if (g.w <= 0.0 && pc.iteration == 3) {
+		// Light shafts also cross the sky, which has no depth, so it reprojects by view direction alone.
+		vec4 far_ = pc.invViewProj * vec4(uv * 2.0 - 1.0, 0.0001, 1.0);
+		vec4 skyClip = pc.prevViewProj * vec4(normalize(far_.xyz / far_.w) * 1000.0, 1.0);
+		vec2 skyUv = skyClip.xy / skyClip.w * 0.5 + 0.5;
+		vec3 skyColor = noisy;
+		if (pc.cameraDelta.w > 0.5 && skyClip.w > 0.0 && all(greaterThanEqual(skyUv, vec2(0.0))) && all(lessThan(skyUv, vec2(1.0)))) {
+			vec3 lowest = noisy, highest = noisy;
+			for (int y = -2; y <= 2; y++) {
+				for (int x = -2; x <= 2; x++) {
+					vec3 c = imageLoad(noisyImage, clamp(p + ivec2(x, y), ivec2(0), size - 1)).rgb;
+					lowest = min(lowest, c);
+					highest = max(highest, c);
+				}
+			}
+			skyColor = mix(clamp(imageLoad(historyPrevious, ivec2(skyUv * vec2(size))).rgb, lowest, highest), noisy, 0.08);
+		}
+		imageStore(historyCurrent, p, vec4(skyColor, 16.0));
+		imageStore(momentsCurrent, p, vec4(0.0));
+		imageStore(filterB, p, vec4(skyColor, 0.0));
+		return;
+	}
+	if (g.w <= 0.0) {
+		imageStore(historyCurrent, p, vec4(1.0, 1.0, 1.0, 0.0));
+		imageStore(momentsCurrent, p, vec4(1.0));
+		imageStore(filterB, p, vec4(1.0, 1.0, 1.0, 0.0));
+		return;
+	}
+
+	// Reproject using the depth-derived position; the same ray direction comes from the current inverse matrix.
+	vec3 pos = unprojectUv(uv, imageLoad(renderDepthImage, fp).r);
+	// Captured entity vertices are relative to the camera of their own frame, so their motion already covers the camera's.
+	vec4 motion = imageLoad(motionImage, fp);
+	vec3 previousPos = pos + (motion.w > 0.5 ? motion.xyz : pc.cameraDelta.xyz);
+	vec4 clip = pc.prevViewProj * vec4(previousPos, 1.0);
+	vec2 prevUv = clip.xy / clip.w * 0.5 + 0.5;
+	float expected = length(previousPos);
+
+	vec3 history = vec3(0.0);
+	float moment = 0.0, length_ = 0.0, totalWeight = 0.0;
+	if (motion.w >= 0.0 && pc.cameraDelta.w > 0.5 && clip.w > 0.0 && all(greaterThanEqual(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)))) {
+		vec2 texel = prevUv * vec2(size) - 0.5;
+		ivec2 base = ivec2(floor(texel));
+		vec2 f = texel - vec2(base);
+		for (int y = 0; y < 2; y++) {
+			for (int x = 0; x < 2; x++) {
+				ivec2 q = clamp(base + ivec2(x, y), ivec2(0), size - 1);
+				vec4 prevG = imageLoad(gPrevious, min(q * scale, fullSize - 1));
+				if (prevG.w <= 0.0 || abs(prevG.w - expected) > 0.1 + 0.02 * expected || dot(prevG.xyz, g.xyz) < 0.9) continue;
+				float weight = (x == 0 ? 1.0 - f.x : f.x) * (y == 0 ? 1.0 - f.y : f.y);
+				vec4 h = imageLoad(historyPrevious, q);
+				history += h.rgb * weight;
+				length_ += h.a * weight;
+				moment += imageLoad(momentsPrevious, q).r * weight;
+				totalWeight += weight;
+			}
+		}
+	}
+
+	// Clamp history to what this frame's neighbourhood can see, so shadows of moving things don't leave trails.
+	vec3 mean = vec3(0.0), squared = vec3(0.0);
+	for (int y = -2; y <= 2; y++) {
+		for (int x = -2; x <= 2; x++) {
+			vec3 c = imageLoad(noisyImage, clamp(p + ivec2(x, y), ivec2(0), size - 1)).rgb;
+			mean += c;
+			squared += c * c;
+		}
+	}
+	mean /= 25.0;
+	vec3 deviation = sqrt(max(squared / 25.0 - mean * mean, vec3(0.0)));
+
+	vec3 color;
+	float count, secondMoment;
+	float lum = luminance(noisy);
+	if (totalWeight > 0.001) {
+		history = clamp(history / totalWeight, mean - deviation * 2.0 - 0.02, mean + deviation * 2.0 + 0.02);
+		count = min(length_ / totalWeight + 1.0, MAX_HISTORY);
+		float alpha = 1.0 / count;
+		color = mix(history, noisy, alpha);
+		secondMoment = mix(moment / totalWeight, lum * lum, alpha);
+	} else {
+		color = mean;
+		count = 1.0;
+		secondMoment = luminance(mean) * luminance(mean) + luminance(deviation) * luminance(deviation);
+	}
+	imageStore(historyCurrent, p, vec4(color, count));
+	imageStore(momentsCurrent, p, vec4(secondMoment));
+	float colorLum = luminance(color);
+	float variance = count < 4.0 ? 1.0 : max(secondMoment - colorLum * colorLum, 0.0);
+	imageStore(filterB, p, vec4(color, variance));
+}

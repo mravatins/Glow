@@ -1,0 +1,7 @@
+.gradle/
+build/
+run/
+*.class
+
+# NVIDIA SDK download and binaries (large, and under NVIDIA licence terms).
+vendor/

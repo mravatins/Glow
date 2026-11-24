@@ -1,0 +1,5 @@
+# Keep LF on every platform: gradlew and the docs' commands run from a POSIX shell, and a CRLF gradlew fails there.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.jar binary
+*.png binary
